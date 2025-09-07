@@ -1,262 +1,203 @@
+# streamlit_campaign_performance.py
+
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-import io
+import numpy as np
+import plotly.graph_objs as go
+from datetime import timedelta
 
-# =========================
-#  Data Cleaning Function
-# =========================
-def clean_and_impute(df,
-                     date_col='Date',
-                     month_col='Month',
-                     value_col='Value',
-                     carpet_col='Carpet Area',
-                     store_open_col='Store Open Date',
-                     brand_col='Brand Name'):
+# -----------------------------
+# Utility Functions
+# -----------------------------
+
+def clean_data(df):
+    """Basic cleaning: parse dates and ensure numeric columns."""
     df = df.copy()
+    if "Date" not in df.columns:
+        st.error("CSV must contain a 'Date' column.")
+        return None
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    for col in df.columns:
+        if col != "Date":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.set_index("Date").sort_index()
 
-    # Rename sales column
-    df = df.rename(columns={value_col: 'sales'})
+def auto_select_control(df, target, exclude_cols):
+    """Pick control with highest absolute correlation to target (excluding targets)."""
+    correlations = {}
+    for col in df.columns:
+        if col not in exclude_cols:
+            corr = df[target].corr(df[col])
+            if not np.isnan(corr):
+                correlations[col] = corr
+    if not correlations:
+        return None, {}
+    best_control = max(correlations, key=lambda x: abs(correlations[x]))
+    return best_control, correlations
 
-    # Parse dates
-    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-    df['month_parsed'] = pd.to_datetime(
-        df[month_col].astype(str).str.replace("'", "").str.strip(),
-        format='%b%y',
-        errors='coerce'
-    )
-    if store_open_col in df.columns:
-        df[store_open_col] = pd.to_datetime(df[store_open_col], errors='coerce')
+def run_incrementality_analysis(df, target, control, pre_start, pre_end, camp_start, camp_end):
+    """Difference-in-Differences style computation."""
+    try:
+        target_series = df[target].loc[pre_start:camp_end]
+        control_series = df[control].loc[pre_start:camp_end]
 
-    # Clean numeric
-    def clean_numeric(s):
-        return pd.to_numeric(
-            s.astype(str).str.replace(r'[^0-9\.\-]', '', regex=True),
-            errors='coerce'
-        )
-    df['sales'] = clean_numeric(df['sales'])
-    if carpet_col in df.columns:
-        df[carpet_col] = clean_numeric(df[carpet_col])
+        target_pre = target_series.loc[pre_start:pre_end]
+        control_pre = control_series.loc[pre_start:pre_end]
+        target_post = target_series.loc[camp_start:camp_end]
+        control_post = control_series.loc[camp_start:camp_end]
 
-    # Drop brands with >30% missing
-    brand_missing = df.groupby(brand_col)['sales'].apply(lambda x: x.isna().mean())
-    keep_brands = brand_missing[brand_missing <= 0.3].index
-    df = df[df[brand_col].isin(keep_brands)]
+        if target_pre.empty or target_post.empty or control_pre.empty or control_post.empty:
+            return {"error": "Data unavailable for the selected range."}
 
-    # Imputation
-    def impute_brand(g):
-        g = g.sort_values(date_col).set_index(date_col)
-        s = g['sales']
-        s_interp = s.interpolate(method='time', limit_direction='both')
-        s_filled = s_interp.fillna(s.median()).fillna(0)
-        g['sales_imputed'] = s_filled
-        g['imputed_flag'] = s.isna() & g['sales_imputed'].notna()
-        return g.reset_index()
+        # Scale control to match target in pre period
+        scale = target_pre.mean() / control_pre.mean() if control_pre.mean() != 0 else 1
+        expected_post = control_post * scale
 
-    df = df.groupby(brand_col, group_keys=False).apply(impute_brand).reset_index(drop=True)
+        # Incrementality = actual - expected
+        incrementality = target_post.sum() - expected_post.sum()
+        roi = (incrementality / expected_post.sum()) if expected_post.sum() != 0 else np.nan
 
-    return df
-
-
-# =========================
-#  Incrementality Function
-# =========================
-def run_incrementality_analysis(df, targets, controls, pre_start, pre_end,
-                                post_start, post_end, campaign_start, campaign_end,
-                                spend=None):
-    """
-    Incrementality analysis using parallel assumption.
-    """
-
-    results = {}
-    total_expected, total_actual = 0, 0
-
-    for target in targets:
-        # --- Extract target series ---
-        mask_target = df["Brand Name"] == target
-        target_df = df.loc[mask_target, ["Date", "sales_imputed"]].dropna()
-
-        if target_df.empty:
-            results[target] = {"error": "Data unavailable"}
-            continue
-
-        # Split into pre and post
-        target_pre = target_df[
-            (target_df["Date"] >= pre_start) & (target_df["Date"] <= pre_end)
-        ].set_index("Date")["sales_imputed"]
-
-        target_post = target_df[
-            (target_df["Date"] >= post_start) & (target_df["Date"] <= post_end)
-        ].set_index("Date")["sales_imputed"]
-
-        if target_pre.empty or target_post.empty:
-            results[target] = {"error": "Data unavailable"}
-            continue
-
-        # --- Extract controls ---
-        control_series_list = []
-        for control in controls:
-            mask_ctrl = df["Brand Name"] == control
-            ctrl_df = df.loc[mask_ctrl, ["Date", "sales_imputed"]].dropna()
-            ctrl_series = ctrl_df.set_index("Date")["sales_imputed"]
-
-            # Align on pre-period
-            common_index = target_pre.index.intersection(ctrl_series.index)
-            if common_index.empty:
-                continue
-
-            scale = target_pre.loc[common_index].mean() / ctrl_series.loc[common_index].mean()
-            expected_ctrl = ctrl_series * scale
-            control_series_list.append(expected_ctrl)
-
-        if not control_series_list:
-            results[target] = {"error": "Data unavailable"}
-            continue
-
-        # Combine multiple controls (sum)
-        combined_control = sum(control_series_list)
-
-        # Expected post = control (scaled) on post-period dates
-        expected_post = combined_control.loc[combined_control.index.intersection(target_post.index)]
-
-        if expected_post.empty:
-            results[target] = {"error": "Data unavailable"}
-            continue
-
-        # --- Metrics ---
-        actual_post = target_post.loc[expected_post.index]
-        increment = actual_post.sum() - expected_post.sum()
-        lift_pct = (increment / expected_post.sum()) * 100 if expected_post.sum() > 0 else None
-        roi = (increment / spend) if (spend and spend > 0) else None
-
-        total_expected += expected_post.sum()
-        total_actual += actual_post.sum()
-
-        results[target] = {
-            "expected": expected_post,
-            "actual": actual_post,
-            "increment": increment,
-            "lift_pct": lift_pct,
+        return {
+            "actual": target_series,
+            "expected": control_series * scale,
+            "incrementality": incrementality,
             "roi": roi,
-            "controls_used": controls,
         }
+    except Exception as e:
+        return {"error": str(e)}
 
-    # --- Total metrics ---
-    total_increment = total_actual - total_expected
-    total_lift = (total_increment / total_expected) * 100 if total_expected > 0 else None
-    total_roi = (total_increment / spend) if (spend and spend > 0) else None
+def make_plot(target, res, camp_start, camp_end):
+    """Plot individual brand incrementality graph."""
+    if "error" in res:
+        return None
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=res["expected"].index, y=res["expected"], mode="lines",
+        name=f"{target} Expected", line=dict(dash="dash")
+    ))
+    fig.add_trace(go.Scatter(
+        x=res["actual"].index, y=res["actual"], mode="lines",
+        name=f"{target} Actual"
+    ))
+    fig.add_vrect(x0=camp_start, x1=camp_end, fillcolor="LightSalmon", opacity=0.3,
+                  layer="below", line_width=0)
+    fig.update_layout(title=f"Incrementality Report: {target}",
+                      xaxis_title="Date", yaxis_title="Sales")
+    return fig
 
-    results["total"] = {
-        "increment": total_increment,
-        "lift_pct": total_lift,
-        "roi": total_roi,
-    }
+def make_total_plot(results, camp_start, camp_end):
+    """Plot total combined incrementality graph."""
+    dfs = []
+    for res in results.values():
+        if "error" in res:
+            continue
+        df = res["actual"].to_frame("actual")
+        df["expected"] = res["expected"]
+        dfs.append(df)
 
-    return results
+    if not dfs:
+        return None, None, None
 
+    combined = sum(dfs)
+    total_incrementality = combined["actual"].sum() - combined["expected"].sum()
+    total_roi = (total_incrementality / combined["expected"].sum()) if combined["expected"].sum() != 0 else np.nan
 
-# =========================
-#  Streamlit App
-# =========================
-st.title("📊 Marketing Incrementality Analysis")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=combined["expected"], mode="lines",
+        name="Total Expected", line=dict(dash="dash")
+    ))
+    fig.add_trace(go.Scatter(
+        x=combined.index, y=combined["actual"], mode="lines",
+        name="Total Actual"
+    ))
+    fig.add_vrect(x0=camp_start, x1=camp_end, fillcolor="LightGreen", opacity=0.3,
+                  layer="below", line_width=0)
+    fig.update_layout(title="Total Incrementality Report (All Targets Combined)",
+                      xaxis_title="Date", yaxis_title="Sales")
+    return fig, total_incrementality, total_roi
 
-# Upload Data
-uploaded = st.file_uploader("Upload sales CSV", type=["csv"])
-if uploaded:
-    df_raw = pd.read_csv(uploaded)
-    df = clean_and_impute(df_raw)
-    st.success("✅ Data uploaded and cleaned.")
-else:
-    st.stop()
+# -----------------------------
+# Streamlit App
+# -----------------------------
 
-# Campaign CSV option
-st.subheader("Campaign Info")
-st.download_button(
-    "⬇️ Download empty campaign template",
-    data="Campaign Name,Target,Control,PrePeriodStart,PrePeriodEnd,MeasurementStart,MeasurementEnd,CampaignStart,CampaignEnd,Spend\n",
-    file_name="campaign_template.csv",
-    mime="text/csv"
-)
+st.title("📊 Campaign Incrementality Analysis")
 
-campaign_file = st.file_uploader("Upload campaign CSV (optional)", type=["csv"])
-if campaign_file:
-    campaign_data = pd.read_csv(campaign_file)
-else:
-    st.info("Or enter campaigns manually:")
-    campaign_data = pd.DataFrame([{
-        "Campaign Name": st.text_input("Campaign Name"),
-        "Target": st.selectbox("Target Brand", sorted(df['Brand Name'].unique())),
-        "Control": st.selectbox("Control Brand", sorted(df['Brand Name'].unique())),
-        "PrePeriodStart": st.date_input("PrePeriod Start"),
-        "PrePeriodEnd": st.date_input("PrePeriod End"),
-        "MeasurementStart": st.date_input("Measurement Start"),
-        "MeasurementEnd": st.date_input("Measurement End"),
-        "CampaignStart": st.date_input("Campaign Start"),
-        "CampaignEnd": st.date_input("Campaign End"),
-        "Spend": st.number_input("Spend", value=0.0, step=100.0)
-    }])
+uploaded_file = st.file_uploader("Upload sales data CSV", type=["csv"])
+if uploaded_file:
+    df = clean_data(pd.read_csv(uploaded_file))
+    if df is not None:
+        st.success("Data uploaded successfully!")
 
-# =========================
-#  Generate Reports
-# =========================
-if st.button("Generate Reports"):
-    if campaign_data.empty:
-        st.error("⚠️ Please upload or enter campaign information.")
-    else:
-        all_results = []
-        for _, camp in campaign_data.iterrows():
-            st.subheader(f"📑 {camp['Campaign Name']}")
-
-            result = run_incrementality_analysis(
-                df, camp['Target'], camp['Control'],
-                pd.to_datetime(camp['PrePeriodStart']),
-                pd.to_datetime(camp['PrePeriodEnd']),
-                pd.to_datetime(camp['MeasurementStart']),
-                pd.to_datetime(camp['MeasurementEnd']),
-                pd.to_datetime(camp['CampaignStart']),
-                pd.to_datetime(camp['CampaignEnd'])
-            )
-
-            if result is None:
-                st.warning(f"⚠️ Data unavailable for {camp['Campaign Name']}")
-                continue
-
-            # Show chart + KPIs
-            st.plotly_chart(result['fig'], use_container_width=True)
-            st.markdown(f"""
-            - **Incremental Sales:** {result['incremental_sales']:.2f}  
-            - **ROI:** {result['roi']:.2f}  
-            - **Correlation (Pre-Period):** {result['correlation']:.2f}  
-            - **Chosen Control:** {result['control']}  
-            """)
-
-            # Save HTML report
-            html_buf = io.StringIO()
-            result['fig'].write_html(html_buf, include_plotlyjs='cdn')
-            st.download_button(
-                label="⬇️ Download Report (HTML)",
-                data=html_buf.getvalue(),
-                file_name=f"{camp['Campaign Name']}_report.html",
-                mime="text/html"
-            )
-
-            # Collect for CSV
-            all_results.append({
-                "Campaign Name": camp['Campaign Name'],
-                "Incremental Sales": result['incremental_sales'],
-                "ROI": result['roi'],
-                "Correlation": result['correlation'],
-                "Control": result['control'],
-                "Spend": camp['Spend']
+        # Campaign info input
+        st.subheader("Campaign Information")
+        with st.expander("Upload Campaign CSV (optional)"):
+            example_csv = pd.DataFrame({
+                "Target": ["Brand1"],
+                "CampaignStart": ["2023-07-01"],
+                "CampaignEnd": ["2023-07-31"]
             })
+            st.download_button("Download Empty Campaign Template", example_csv.to_csv(index=False), "campaign_template.csv")
+            camp_file = st.file_uploader("Upload Campaign CSV", type=["csv"], key="camp_csv")
+            if camp_file:
+                campaigns = pd.read_csv(camp_file)
+            else:
+                target = st.selectbox("Select Target Brand", df.columns.drop("Date"))
+                camp_start = st.date_input("Campaign Start")
+                camp_end = st.date_input("Campaign End")
+                campaigns = pd.DataFrame([{"Target": target, "CampaignStart": camp_start, "CampaignEnd": camp_end}])
 
-        if all_results:
-            summary_df = pd.DataFrame(all_results)
-            st.dataframe(summary_df)
-            csv_buf = summary_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download Summary CSV",
-                data=csv_buf,
-                file_name="campaign_summary.csv",
-                mime="text/csv"
-            )
+        # PrePeriod input
+        st.subheader("PrePeriod Selection")
+        auto_pre = st.checkbox("Auto-select PrePeriod (6 months before campaign start)", value=True)
+        manual_pre_start, manual_pre_end = None, None
+        if not auto_pre:
+            manual_pre_start = st.date_input("PrePeriod Start")
+            manual_pre_end = st.date_input("PrePeriod End")
+
+        # Run analysis
+        if st.button("Generate Reports"):
+            for _, camp in campaigns.iterrows():
+                target = camp["Target"]
+                camp_start = pd.to_datetime(camp["CampaignStart"])
+                camp_end = pd.to_datetime(camp["CampaignEnd"])
+                if auto_pre:
+                    pre_start = camp_start - timedelta(days=180)
+                    pre_end = camp_start - timedelta(days=1)
+                else:
+                    pre_start = pd.to_datetime(manual_pre_start)
+                    pre_end = pd.to_datetime(manual_pre_end)
+
+                # Auto select control
+                control, corrs = auto_select_control(df, target, exclude_cols=[target])
+                if not control:
+                    st.warning(f"No valid control found for {target}. Skipping...")
+                    continue
+
+                result = {}
+                res = run_incrementality_analysis(df, target, control, pre_start, pre_end, camp_start, camp_end)
+                result[target] = res
+
+                # Show correlations
+                st.write(f"### {target} - Control Variables Correlations")
+                corr_df = pd.DataFrame.from_dict(corrs, orient="index", columns=["Correlation"])
+                st.dataframe(corr_df)
+
+                # Individual plots
+                fig = make_plot(target, res, camp_start, camp_end)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                    if "error" not in res:
+                        st.write(f"**Incrementality ({target})**: {res['incrementality']:.2f}")
+                        st.write(f"**ROI ({target})**: {res['roi']:.2%}")
+
+            # Combined total
+            st.subheader("📊 Combined Impact Across All Targets")
+            total_fig, total_inc, total_roi = make_total_plot(result, camp_start, camp_end)
+            if total_fig:
+                st.plotly_chart(total_fig, use_container_width=True)
+                st.write(f"**Total Incrementality**: {total_inc:.2f}")
+                st.write(f"**Total ROI**: {total_roi:.2%}")
+            else:
+                st.warning("No valid results for combined total.")
