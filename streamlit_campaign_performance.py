@@ -143,7 +143,12 @@ if uploaded_file:
             if camp_file:
                 campaigns = pd.read_csv(camp_file)
             else:
-                target = st.selectbox("Select Target Brand", df.columns.drop("Date"))
+                valid_targets = [c for c in df.columns if c not in ["Date"]]
+                if not valid_targets:
+                    st.error("No valid target columns found in your CSV.")
+                else:
+                    target = st.selectbox("Select Target Brand", valid_targets)
+
                 camp_start = st.date_input("Campaign Start")
                 camp_end = st.date_input("Campaign End")
                 campaigns = pd.DataFrame([{"Target": target, "CampaignStart": camp_start, "CampaignEnd": camp_end}])
