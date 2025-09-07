@@ -61,50 +61,98 @@ def clean_and_impute(df,
 # =========================
 #  Incrementality Function
 # =========================
-def run_incrementality_analysis(df, target, control, pre_start, pre_end,
-                                post_start, post_end, camp_start, camp_end):
-    # Slice periods
-    mask_pre = (df['Date'] >= pre_start) & (df['Date'] <= pre_end) & (df['Brand Name'] == target)
-    mask_post = (df['Date'] >= post_start) & (df['Date'] <= post_end) & (df['Brand Name'] == target)
-    mask_ctrl = (df['Date'] >= pre_start) & (df['Date'] <= post_end) & (df['Brand Name'] == control)
+def run_incrementality_analysis(df, targets, controls, pre_start, pre_end,
+                                post_start, post_end, campaign_start, campaign_end,
+                                spend=None):
+    """
+    Incrementality analysis using parallel assumption.
+    """
 
-    if mask_pre.sum() == 0 or mask_post.sum() == 0 or mask_ctrl.sum() == 0:
-        return None
+    results = {}
+    total_expected, total_actual = 0, 0
 
-    # Series
-    target_pre = df.loc[mask_pre, 'sales_imputed']
-    target_post = df.loc[mask_post, 'sales_imputed']
-    control_series = df.loc[mask_ctrl, ['Date', 'sales_imputed']].set_index('Date')
+    for target in targets:
+        # --- Extract target series ---
+        mask_target = df["Brand Name"] == target
+        target_df = df.loc[mask_target, ["Date", "sales_imputed"]].dropna()
 
-    # Expected = parallel shift
-    scale = target_pre.mean() / control_series.loc[target_pre.index].mean()
-    expected = control_series['sales_imputed'] * scale
-    expected = expected.loc[target_post.index]
+        if target_df.empty:
+            results[target] = {"error": "Data unavailable"}
+            continue
 
-    actual = target_post
-    incremental_sales = actual.sum() - expected.sum()
-    roi = (incremental_sales / actual.sum()) if actual.sum() > 0 else 0
-    corr = target_pre.corr(control_series.loc[target_pre.index, 'sales_imputed'])
+        # Split into pre and post
+        target_pre = target_df[
+            (target_df["Date"] >= pre_start) & (target_df["Date"] <= pre_end)
+        ].set_index("Date")["sales_imputed"]
 
-    # Plot
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=actual.index, y=actual.values,
-                             mode='lines+markers', name="Actual Sales"))
-    fig.add_trace(go.Scatter(x=expected.index, y=expected.values,
-                             mode='lines+markers', name="Expected Sales"))
-    fig.add_trace(go.Scatter(x=control_series.index, y=control_series['sales_imputed'],
-                             mode='lines', name="Control Sales", line=dict(dash='dot')))
-    fig.add_vrect(x0=camp_start, x1=camp_end, fillcolor="LightSalmon",
-                  opacity=0.3, line_width=0, annotation_text="Campaign Period",
-                  annotation_position="top left")
+        target_post = target_df[
+            (target_df["Date"] >= post_start) & (target_df["Date"] <= post_end)
+        ].set_index("Date")["sales_imputed"]
 
-    return {
-        "fig": fig,
-        "incremental_sales": incremental_sales,
-        "roi": roi,
-        "correlation": corr,
-        "control": control
+        if target_pre.empty or target_post.empty:
+            results[target] = {"error": "Data unavailable"}
+            continue
+
+        # --- Extract controls ---
+        control_series_list = []
+        for control in controls:
+            mask_ctrl = df["Brand Name"] == control
+            ctrl_df = df.loc[mask_ctrl, ["Date", "sales_imputed"]].dropna()
+            ctrl_series = ctrl_df.set_index("Date")["sales_imputed"]
+
+            # Align on pre-period
+            common_index = target_pre.index.intersection(ctrl_series.index)
+            if common_index.empty:
+                continue
+
+            scale = target_pre.loc[common_index].mean() / ctrl_series.loc[common_index].mean()
+            expected_ctrl = ctrl_series * scale
+            control_series_list.append(expected_ctrl)
+
+        if not control_series_list:
+            results[target] = {"error": "Data unavailable"}
+            continue
+
+        # Combine multiple controls (sum)
+        combined_control = sum(control_series_list)
+
+        # Expected post = control (scaled) on post-period dates
+        expected_post = combined_control.loc[combined_control.index.intersection(target_post.index)]
+
+        if expected_post.empty:
+            results[target] = {"error": "Data unavailable"}
+            continue
+
+        # --- Metrics ---
+        actual_post = target_post.loc[expected_post.index]
+        increment = actual_post.sum() - expected_post.sum()
+        lift_pct = (increment / expected_post.sum()) * 100 if expected_post.sum() > 0 else None
+        roi = (increment / spend) if (spend and spend > 0) else None
+
+        total_expected += expected_post.sum()
+        total_actual += actual_post.sum()
+
+        results[target] = {
+            "expected": expected_post,
+            "actual": actual_post,
+            "increment": increment,
+            "lift_pct": lift_pct,
+            "roi": roi,
+            "controls_used": controls,
+        }
+
+    # --- Total metrics ---
+    total_increment = total_actual - total_expected
+    total_lift = (total_increment / total_expected) * 100 if total_expected > 0 else None
+    total_roi = (total_increment / spend) if (spend and spend > 0) else None
+
+    results["total"] = {
+        "increment": total_increment,
+        "lift_pct": total_lift,
+        "roi": total_roi,
     }
+
+    return results
 
 
 # =========================
