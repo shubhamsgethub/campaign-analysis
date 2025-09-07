@@ -135,54 +135,65 @@ def pick_top_control(pivot, target, pre_start, pre_end, exclude=None):
 # -----------------------
 def run_did_and_build_counterfactual(panel_df, targets, control_pool, pre_start, pre_end, meas_start, meas_end, use_log=True):
     """
-    panel_df: DataFrame long format with columns ['Date','Brand Name','sales_imputed']
-    targets: list of treated brands
-    control_pool: list of candidate controls (brands)
-    returns: dict with model, per_target results, combined series and totals
+    Fixed version: renames 'Brand Name' -> 'Brand' locally to avoid patsy formula syntax errors.
+    panel_df: DataFrame with columns ['Date','Brand Name','sales_imputed']
     """
     df = panel_df.copy()
-    df['Date'] = pd.to_datetime(df['Date'])
-    # restrict to pre + measurement window (we may need brand/date fixed effects)
-    window_mask = (df['Date'] >= pre_start) & (df['Date'] <= meas_end)
+
+    # --- defensive: parse dates and drop bad rows ---
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    if df['Date'].isna().any():
+        # drop rows with unparsable dates (warn upstream)
+        df = df.dropna(subset=['Date'])
+    if df.empty:
+        return {"error": "No valid Date values after parsing."}
+
+    # --- rename Brand Name to Brand for safe formula usage ---
+    if 'Brand Name' in df.columns:
+        df = df.rename(columns={'Brand Name': 'Brand'})
+    elif 'Brand' not in df.columns:
+        return {"error": "No 'Brand Name' or 'Brand' column found in data."}
+
+    # restrict to relevant window (pre + measurement)
+    window_mask = (df['Date'] >= pd.to_datetime(pre_start)) & (df['Date'] <= pd.to_datetime(meas_end))
     df = df.loc[window_mask].copy()
     if df.empty:
         return {"error": "No data in the selected pre+measurement window."}
 
     # define treated & post dummies
-    df['treated'] = df['Brand Name'].isin(targets).astype(int)
-    df['post'] = df['Date'].between(meas_start, meas_end).astype(int)
+    df['treated'] = df['Brand'].isin(targets).astype(int)
+    df['post'] = df['Date'].between(pd.to_datetime(meas_start), pd.to_datetime(meas_end)).astype(int)
     df['D'] = df['treated'] * df['post']
 
-    # control pool fallback
+    # fallback control pool
     if not control_pool:
-        control_pool = [b for b in df['Brand Name'].unique() if b not in targets]
+        control_pool = [b for b in df['Brand'].unique() if b not in targets]
+    # control sum series for diagnostics
+    control_sum = df.loc[df['Brand'].isin(control_pool)].groupby('Date')['sales_imputed'].sum().rename('control_sum')
 
-    # aggregate control sum (for diagnostics/plot)
-    control_sum = df.loc[df['Brand Name'].isin(control_pool)].groupby('Date')['sales_imputed'].sum().rename('control_sum')
-
-    # outcome for regression (log or level)
+    # outcome
     if use_log:
+        # safe: add small epsilon inside log1p handled by np.log1p
         df['y'] = np.log1p(df['sales_imputed'])
     else:
         df['y'] = df['sales_imputed']
 
-    # regression formula: D + brand FE + date FE
-    # Use backticks for column names with spaces
-    formula = 'y ~ D + C(`Brand Name`) + C(`Date`)'
+    # --- safe formula using renamed column ---
+    formula = 'y ~ D + C(Brand) + C(Date)'
+
     try:
-        mod = smf.ols(formula=formula, data=df).fit(cov_type='cluster', cov_kwds={'groups': df['Brand Name']})
+        mod = smf.ols(formula=formula, data=df).fit(cov_type='cluster', cov_kwds={'groups': df['Brand']})
     except Exception as e:
         return {"error": f"Regression failed: {e}"}
 
-    # Build counterfactual: set D=0 for treated rows in measurement period
+    # build counterfactual (D=0 for treated in post)
     df_cf = df.copy()
     df_cf.loc[(df_cf['treated'] == 1) & (df_cf['post'] == 1), 'D'] = 0
 
-    # predictions (on y scale)
+    # predictions
     pred_y = mod.predict(df)
     pred_cf_y = mod.predict(df_cf)
 
-    # convert back to sales scale
     if use_log:
         df['pred_sales'] = np.expm1(pred_y)
         df_cf['pred_cf_sales'] = np.expm1(pred_cf_y)
@@ -190,15 +201,12 @@ def run_did_and_build_counterfactual(panel_df, targets, control_pool, pre_start,
         df['pred_sales'] = pred_y
         df_cf['pred_cf_sales'] = pred_cf_y
 
-    # Per-target results
+    # per-target aggregation & metrics (measurement window)
     per_target = {}
     for t in targets:
-        mask_t = (df['Brand Name'] == t)
-        # measurement slice
-        meas_mask = mask_t & (df['Date'].between(meas_start, meas_end))
-        actual_series = df.loc[meas_mask, ['Date', 'sales_imputed']].set_index('Date').sort_index()['sales_imputed']
-        expected_series = df_cf.loc[meas_mask, ['Date', 'pred_cf_sales']].set_index('Date').sort_index()['pred_cf_sales']
-        # align indices
+        mask_t_meas = (df['Brand'] == t) & (df['Date'].between(pd.to_datetime(meas_start), pd.to_datetime(meas_end)))
+        actual_series = df.loc[mask_t_meas, ['Date', 'sales_imputed']].set_index('Date').sort_index()['sales_imputed']
+        expected_series = df_cf.loc[mask_t_meas, ['Date', 'pred_cf_sales']].set_index('Date').sort_index()['pred_cf_sales']
         idx = actual_series.index.union(expected_series.index).sort_values()
         actual_series = actual_series.reindex(idx).fillna(0.0)
         expected_series = expected_series.reindex(idx).fillna(0.0)
@@ -207,8 +215,8 @@ def run_did_and_build_counterfactual(panel_df, targets, control_pool, pre_start,
         incremental = actual_total - expected_total
         lift_pct = (incremental / expected_total * 100) if expected_total != 0 else None
 
-        # pre-period correlation with control_sum (alignment)
-        t_pre = df.loc[(df['Brand Name'] == t) & (df['Date'].between(pre_start, pre_end))].set_index('Date')['sales_imputed']
+        # pre-period correlation with control_sum
+        t_pre = df.loc[(df['Brand'] == t) & (df['Date'].between(pd.to_datetime(pre_start), pd.to_datetime(pre_end))), ['Date','sales_imputed']].set_index('Date')['sales_imputed']
         control_pre = control_sum.loc[control_sum.index.intersection(t_pre.index)]
         corr_pre = float(t_pre.corr(control_pre)) if (not t_pre.empty and not control_pre.empty) else None
 
@@ -222,11 +230,10 @@ def run_did_and_build_counterfactual(panel_df, targets, control_pool, pre_start,
             'corr_pre': corr_pre
         }
 
-    # Combined across targets
-    mask_targets_meas = (df['Brand Name'].isin(targets)) & (df['Date'].between(meas_start, meas_end))
+    # combined totals
+    mask_targets_meas = (df['Brand'].isin(targets)) & (df['Date'].between(pd.to_datetime(meas_start), pd.to_datetime(meas_end)))
     actual_comb = df.loc[mask_targets_meas].groupby('Date')['sales_imputed'].sum().sort_index()
     expected_comb = df_cf.loc[mask_targets_meas].groupby('Date')['pred_cf_sales'].sum().sort_index()
-    # reindex
     idx_all = actual_comb.index.union(expected_comb.index).sort_values()
     actual_comb = actual_comb.reindex(idx_all).fillna(0.0)
     expected_comb = expected_comb.reindex(idx_all).fillna(0.0)
@@ -235,7 +242,6 @@ def run_did_and_build_counterfactual(panel_df, targets, control_pool, pre_start,
     total_incremental = float(total_actual - total_expected)
     total_lift_pct = float(total_incremental / total_expected * 100) if total_expected != 0 else None
 
-    # DiD beta interpretation on log-scale
     beta = float(mod.params['D']) if 'D' in mod.params else None
     beta_se = float(mod.bse['D']) if 'D' in mod.bse else None
     beta_pval = float(mod.pvalues['D']) if 'D' in mod.pvalues else None
